@@ -9,17 +9,17 @@ import argparse, json, re, sys, subprocess
 from pathlib import Path
 
 REQUIRED = [
-    ("Leading Genre DNA", ["leading genre dna", "genredna", "cinematic", "hybrid", "trailer"]),
-    ("Singer Identity", ["singer identity", "singer", "emotional vietnamese female"]),
-    ("Vocal Register", ["vocal register", "low verse", "pre", "belt", "chorus"]),
-    ("Rhythm Section", ["rhythm section", "taiko", "floor tom", "pulse", "6/8"]),
-    ("Signature Motif", ["signature motif", "motif", "child", "paper sun", "ash", "horizon"]),
-    ("Hook Design", ["hook design", "title-drop", "gọi mặt trời", "choir answer"]),
-    ("Arrangement Map", ["arrangement map", "intro", "verse", "pre", "hook", "bridge", "outro"]),
-    ("Instrument Palette", ["instrument palette", "đàn bầu", "strings", "brass", "piano"]),
-    ("Mood Logic", ["mood logic", "grief", "courage", "first light", "hope"]),
-    ("Mix Target", ["mix target", "clear vietnamese vocal", "low-end", "wide", "master"]),
-    ("Strictly Avoid", ["strictly avoid", "generic", "karaoke", "muddy", "recycled"]),
+    ("Leading Genre DNA", ["leading genre dna"]),
+    ("Singer Identity", ["singer identity"]),
+    ("Vocal Register", ["vocal register"]),
+    ("Rhythm Section", ["rhythm section"]),
+    ("Signature Motif", ["signature motif"]),
+    ("Hook Design", ["hook design"]),
+    ("Arrangement Map", ["arrangement map"]),
+    ("Instrument Palette", ["instrument palette"]),
+    ("Mood Logic", ["mood logic"]),
+    ("Mix Target", ["mix target"]),
+    ("Strictly Avoid", ["strictly avoid"]),
 ]
 NEGATIVE_HINTS = ["generic", "karaoke", "muddy", "weak hook", "recycled", "pop-washing"]
 
@@ -52,14 +52,16 @@ def build_compact() -> str:
 LYRIC_REQUIRED_SECTIONS = ["intro", "verse", "pre", "hook", "chorus", "bridge", "outro"]
 AI_FILLER = ["lalala", "placeholder", "insert lyrics", "tbd", "chatgpt"]
 
-def lyric_score(text: str) -> tuple[bool, list[str]]:
+def lyric_score(text: str, title: str | None = None) -> tuple[bool, list[str]]:
     t = norm(text)
     missing = []
     for sec in LYRIC_REQUIRED_SECTIONS:
         if f"[{sec}" not in t and (sec != "hook" or "[chorus" not in t):
             missing.append(f"missing_section:{sec}")
-    if "gọi mặt trời" not in t and "goi mat troi" not in t:
-        missing.append("missing_title_hook")
+    if title:
+        title_words = [w for w in re.split(r"\W+", norm(title)) if len(w) >= 3]
+        if title_words and not any(w in t for w in title_words):
+            missing.append("missing_title_hook")
     if any(x in t for x in AI_FILLER):
         missing.append("placeholder_or_ai_filler")
     if len(text.strip()) < 700:
@@ -161,7 +163,7 @@ def cmd_post(args):
 
 def cmd_lyrics(args):
     text = args.text or Path(args.file).read_text(encoding='utf-8')
-    ok, missing = lyric_score(text)
+    ok, missing = lyric_score(text, args.title)
     print(json.dumps({"ok": ok, "length": len(text), "missing": missing, "audit": "lyrics_structure_hook_vietnamese_integrity"}, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
@@ -171,7 +173,7 @@ def main():
     a=sub.add_parser('build-compact'); a.add_argument('--max-chars', type=int, default=1000)
     a=sub.add_parser('precheck'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--max-chars', type=int, default=1000)
     a=sub.add_parser('postcheck'); a.add_argument('clip_ids', nargs='+'); a.add_argument('--suno', default='/root/.openclaw/workspace/bin/suno')
-    a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file')
+    a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title')
     a=sub.add_parser('playlist-route'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title', required=True); a.add_argument('--playlist'); a.add_argument('--manifest')
     args=p.parse_args()
     return {'build-compact':cmd_build,'precheck':cmd_pre,'postcheck':cmd_post,'lyrics-check':cmd_lyrics,'playlist-route':cmd_route}[args.cmd](args)
