@@ -364,9 +364,10 @@ Required workflow for agents:
 1. Build/prepare compressed structured tags under Suno's tag limit.
 2. Run `scripts/suno_prompt_guard.py precheck --text "$TAGS"` before submit. This checks all 11 block names plus production-detail density.
 3. Run `scripts/suno_prompt_guard.py lyrics-check --file lyrics.txt` before submit. This checks section tags, hook/title integrity, Vietnamese diacritics, and placeholder/filler.
-4. Generate only if both prompt music and lyrics pass.
-5. After generation, run `scripts/suno_prompt_guard.py postcheck <clip_id...>` against real metadata.
-6. Deliver/download/add to playlist only if postcheck passes. If it fails, improve tags and regenerate once; do not present a failed prompt as final.
+4. Run `scripts/suno_prompt_guard.py playlist-route --title "..." --text "$STYLE" --manifest manifest.json` before submit. This resolves the target genre album/playlist before generation.
+5. Generate only if prompt music, lyrics, and playlist routing all pass.
+6. After generation, run `scripts/suno_prompt_guard.py postcheck <clip_id...>` against real metadata.
+7. Deliver/download/add to the resolved playlist only if postcheck passes. If it fails, improve tags and regenerate once; do not present a failed prompt as final.
 
 Example:
 
@@ -374,6 +375,7 @@ Example:
 STYLE=$(scripts/suno_prompt_guard.py build-compact | jq -r .style)
 scripts/suno_prompt_guard.py precheck --text "$STYLE"
 scripts/suno_prompt_guard.py lyrics-check --file lyrics.txt
+scripts/suno_prompt_guard.py playlist-route --title "..." --text "$STYLE" --manifest manifest.json
 suno generate --title "..." --tags "$STYLE" --lyrics-file lyrics.txt --model v5.5 --wait
 scripts/suno_prompt_guard.py postcheck <clip_id_1> <clip_id_2>
 ```
