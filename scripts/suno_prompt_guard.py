@@ -185,18 +185,97 @@ def load_history(path: str | None) -> list[dict]:
     except Exception:
         return []
 
+
+# Broad keyword/pattern-class guard for lyric formula leakage.
+# Do not overfit to one exact example; flag rhetorical frames that repeat across recent songs.
+LINE_PATTERN_CLASSES = {
+    "conditional_surpass": ["nếu", "cao", "hơn"],
+    "darkness_light_reversal": ["đêm", "tối", "sáng"],
+    "ash_dawn_transformation": ["tro", "tàn", "bình", "minh"],
+    "hand_sky_lift": ["tay", "trời", "nâng"],
+    "call_return_light": ["gọi", "về", "sáng"],
+    "wound_to_song": ["vết", "thương", "hát"],
+    "death_to_immortality": ["chết", "sống", "mãi"],
+}
+
+RECENT_MOTIF_KEYWORDS = {
+    "sun_light_cluster": ["mặt trời", "bình minh", "ánh sáng", "màu sáng", "trời mở"],
+    "child_hand_cluster": ["đứa trẻ", "tay bé", "bàn tay", "nâng"],
+    "night_height_cluster": ["đêm", "bóng tối", "cao", "hát cao"],
+    "ash_rebirth_cluster": ["tro", "tàn", "hóa", "bình minh"],
+    "sky_star_cluster": ["trời", "sao", "thiên hà", "vũ trụ"],
+}
+
+def line_pattern_signature(line: str) -> set[str]:
+    t = norm(line)
+    sig = set()
+    for name, kws in LINE_PATTERN_CLASSES.items():
+        hit = sum(1 for k in kws if norm(k) in t)
+        # conditional_surpass needs all core words; other classes need >=2 to stay broad but not hypersensitive.
+        if (name == "conditional_surpass" and hit >= 3) or (name != "conditional_surpass" and hit >= 2):
+            sig.add(name)
+    return sig
+
+def lyric_lines(text: str) -> list[str]:
+    return [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith('[')]
+
+def line_pattern_check(candidate: str, history_rows: list[dict], threshold_recent: int = 10) -> tuple[bool, list[dict]]:
+    cand_lines = lyric_lines(candidate)
+    cand = [(l, line_pattern_signature(l)) for l in cand_lines]
+    cand = [(l, s) for l, s in cand if s]
+    hits = []
+    for row in history_rows[:threshold_recent]:
+        prev_text = '\n'.join(str(row.get(k,'')) for k in ['lyrics','prompt'])
+        title = row.get('title') or row.get('id') or 'previous'
+        for pl in lyric_lines(prev_text):
+            ps = line_pattern_signature(pl)
+            if not ps: continue
+            for cl, cs in cand:
+                shared = sorted(cs & ps)
+                if shared:
+                    hits.append({'class': shared, 'candidate_line': cl, 'previous_line': pl, 'previous_title': title})
+                    if len(hits) >= 8:
+                        return False, hits
+    return (not hits), hits
+
+def motif_window_check(candidate: str, history_rows: list[dict], threshold_recent: int = 10) -> tuple[bool, list[dict]]:
+    t = norm(candidate)
+    cand_clusters = set()
+    for name, kws in RECENT_MOTIF_KEYWORDS.items():
+        if sum(1 for k in kws if norm(k) in t) >= 2:
+            cand_clusters.add(name)
+    hits = []
+    for row in history_rows[:threshold_recent]:
+        prev = norm('\n'.join(str(row.get(k,'')) for k in ['title','style','style_prompt','tags','lyrics','prompt']))
+        for name in cand_clusters:
+            kws = RECENT_MOTIF_KEYWORDS[name]
+            if sum(1 for k in kws if norm(k) in prev) >= 2:
+                hits.append({'cluster': name, 'previous_title': row.get('title') or row.get('id') or 'previous'})
+    return (not hits), hits[:8]
+
 def cmd_novelty(args):
     style = args.style or (Path(args.style_file).read_text(encoding='utf-8') if args.style_file else '')
     lyrics = args.lyrics or (Path(args.lyrics_file).read_text(encoding='utf-8') if args.lyrics_file else '')
     candidate = '\n'.join([args.title or '', style, lyrics])
+    history = load_history(args.history)
     hits=[]
-    for r in load_history(args.history):
+    for r in history:
         prev='\n'.join(str(r.get(k,'')) for k in ['title','style','style_prompt','tags','lyrics','prompt'])
         sc=novelty_sim(candidate, prev)
         if sc >= args.threshold:
             hits.append({'similarity': round(sc,3), 'title': r.get('title'), 'id': r.get('id'), 'created_at': r.get('created_at')})
-    ok=not hits
-    print(json.dumps({'ok':ok,'threshold':args.threshold,'hits':hits[:5],'audit':'novelty_subject_lyric_prompt_motif'},ensure_ascii=False,indent=2))
+    line_ok, line_hits = line_pattern_check(lyrics, history, args.recent)
+    motif_ok, motif_hits = motif_window_check(candidate, history, args.recent)
+    ok = (not hits) and line_ok and motif_ok
+    print(json.dumps({
+        'ok':ok,
+        'threshold':args.threshold,
+        'whole_song_hits':hits[:5],
+        'line_pattern_hits':line_hits,
+        'motif_window_hits':motif_hits,
+        'recent_window':args.recent,
+        'audit':'novelty_subject_lyric_prompt_motif_line_pattern_keyword_class'
+    },ensure_ascii=False,indent=2))
     return 0 if ok else 2
 
 def main():
@@ -207,7 +286,7 @@ def main():
     a=sub.add_parser('postcheck'); a.add_argument('clip_ids', nargs='+'); a.add_argument('--suno', default='/root/.openclaw/workspace/bin/suno')
     a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title')
     a=sub.add_parser('playlist-route'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title', required=True); a.add_argument('--playlist'); a.add_argument('--manifest')
-    a=sub.add_parser('novelty-check'); a.add_argument('--title', required=True); a.add_argument('--style'); a.add_argument('--style-file'); a.add_argument('--lyrics'); a.add_argument('--lyrics-file'); a.add_argument('--history'); a.add_argument('--threshold', type=float, default=0.34)
+    a=sub.add_parser('novelty-check'); a.add_argument('--title', required=True); a.add_argument('--style'); a.add_argument('--style-file'); a.add_argument('--lyrics'); a.add_argument('--lyrics-file'); a.add_argument('--history'); a.add_argument('--threshold', type=float, default=0.34); a.add_argument('--recent', type=int, default=10)
     args=p.parse_args()
     return {'build-compact':cmd_build,'precheck':cmd_pre,'postcheck':cmd_post,'lyrics-check':cmd_lyrics,'playlist-route':cmd_route,'novelty-check':cmd_novelty}[args.cmd](args)
 if __name__ == '__main__': sys.exit(main())
