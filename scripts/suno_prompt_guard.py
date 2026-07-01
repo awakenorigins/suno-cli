@@ -167,6 +167,38 @@ def cmd_lyrics(args):
     print(json.dumps({"ok": ok, "length": len(text), "missing": missing, "audit": "lyrics_structure_hook_vietnamese_integrity"}, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
+def tokens_for_novelty(s: str) -> set[str]:
+    stop=set('và của trong một những cho người không này kia với trên dưới giữa bài hát ta tôi anh em là có còn như đã the and with for into'.split())
+    return {w for w in re.findall(r'[A-Za-zÀ-ỹĐđ]{3,}', norm(s)) if w not in stop}
+
+def novelty_sim(a: str, b: str) -> float:
+    A=tokens_for_novelty(a); B=tokens_for_novelty(b)
+    return len(A & B) / max(1, len(A | B))
+
+def load_history(path: str | None) -> list[dict]:
+    if not path: return []
+    p=Path(path)
+    if not p.exists(): return []
+    try:
+        data=json.loads(p.read_text(encoding='utf-8'))
+        return data if isinstance(data,list) else data.get('runs',[])
+    except Exception:
+        return []
+
+def cmd_novelty(args):
+    style = args.style or (Path(args.style_file).read_text(encoding='utf-8') if args.style_file else '')
+    lyrics = args.lyrics or (Path(args.lyrics_file).read_text(encoding='utf-8') if args.lyrics_file else '')
+    candidate = '\n'.join([args.title or '', style, lyrics])
+    hits=[]
+    for r in load_history(args.history):
+        prev='\n'.join(str(r.get(k,'')) for k in ['title','style','style_prompt','tags','lyrics','prompt'])
+        sc=novelty_sim(candidate, prev)
+        if sc >= args.threshold:
+            hits.append({'similarity': round(sc,3), 'title': r.get('title'), 'id': r.get('id'), 'created_at': r.get('created_at')})
+    ok=not hits
+    print(json.dumps({'ok':ok,'threshold':args.threshold,'hits':hits[:5],'audit':'novelty_subject_lyric_prompt_motif'},ensure_ascii=False,indent=2))
+    return 0 if ok else 2
+
 def main():
     p=argparse.ArgumentParser()
     sub=p.add_subparsers(dest='cmd', required=True)
@@ -175,6 +207,7 @@ def main():
     a=sub.add_parser('postcheck'); a.add_argument('clip_ids', nargs='+'); a.add_argument('--suno', default='/root/.openclaw/workspace/bin/suno')
     a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title')
     a=sub.add_parser('playlist-route'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title', required=True); a.add_argument('--playlist'); a.add_argument('--manifest')
+    a=sub.add_parser('novelty-check'); a.add_argument('--title', required=True); a.add_argument('--style'); a.add_argument('--style-file'); a.add_argument('--lyrics'); a.add_argument('--lyrics-file'); a.add_argument('--history'); a.add_argument('--threshold', type=float, default=0.34)
     args=p.parse_args()
-    return {'build-compact':cmd_build,'precheck':cmd_pre,'postcheck':cmd_post,'lyrics-check':cmd_lyrics,'playlist-route':cmd_route}[args.cmd](args)
+    return {'build-compact':cmd_build,'precheck':cmd_pre,'postcheck':cmd_post,'lyrics-check':cmd_lyrics,'playlist-route':cmd_route,'novelty-check':cmd_novelty}[args.cmd](args)
 if __name__ == '__main__': sys.exit(main())
