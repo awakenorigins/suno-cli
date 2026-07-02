@@ -52,6 +52,28 @@ def build_compact() -> str:
 LYRIC_REQUIRED_SECTIONS = ["intro", "verse", "pre", "hook", "chorus", "bridge", "outro"]
 AI_FILLER = ["lalala", "placeholder", "insert lyrics", "tbd", "chatgpt"]
 
+# F-01: instrumental-aware lyrics gate. Instrumental prompts carry section maps, not sung lyrics.
+INSTRUMENTAL_STYLE_HINTS = [
+    "instrumental", "no vocals", "no vocal", "no singer", "no singing", "no lead vocal",
+    "without vocals", "wordless", "piano trio", "lounge jazz",
+]
+
+def is_instrumental_style(style: str) -> bool:
+    t = norm(style or "")
+    return any(norm(h) in t for h in INSTRUMENTAL_STYLE_HINTS)
+
+def lyric_score_instrumental(text: str) -> tuple[bool, list[str]]:
+    """Instrumental mode: require a section map (>=3 [Section] tags), forbid filler.
+    No verse/chorus/diacritics/700-char requirements (those are vocal-song rules)."""
+    t = norm(text)
+    missing = []
+    sections = [l.strip() for l in text.splitlines() if l.strip().startswith("[")]
+    if len(sections) < 3:
+        missing.append("missing_instrumental_sections_min3")
+    if any(x in t for x in AI_FILLER):
+        missing.append("placeholder_or_ai_filler")
+    return (not missing, missing)
+
 def lyric_score(text: str, title: str | None = None) -> tuple[bool, list[str]]:
     t = norm(text)
     missing = []
@@ -117,15 +139,39 @@ def write_manifest(args, playlist: str, text: str) -> str:
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return str(out)
 
+def guard_slugify(text: str) -> str:
+    import unicodedata
+    text = text.replace('đ', 'd').replace('Đ', 'D')
+    text = ''.join(ch for ch in unicodedata.normalize('NFKD', text) if not unicodedata.combining(ch))
+    text = re.sub(r'[^A-Za-z0-9]+', '-', text).strip('-')
+    return re.sub(r'-+', '-', text) or 'untitled'
+
 def cmd_route(args):
     text = args.text or Path(args.file).read_text(encoding='utf-8')
     playlist = args.playlist or resolve_playlist(text)
     missing = []
+    manifest_info = None
     if not playlist:
         missing.append('playlist_album_unresolved')
+    # Real validation (not decorative): when an albums root is given, the provided/resolved
+    # playlist must map to an existing album manifest with a matching genre.
+    if playlist and getattr(args, 'albums_root', None):
+        mp = Path(args.albums_root) / guard_slugify(playlist) / 'album.json'
+        if not mp.exists():
+            missing.append('playlist_manifest_missing')
+        else:
+            try:
+                man = json.loads(mp.read_text(encoding='utf-8'))
+            except Exception:
+                man = {}
+            manifest_info = {'name': man.get('name'), 'genre': man.get('genre'), 'path': str(mp)}
+            if man.get('name') and man.get('name') != playlist:
+                missing.append('playlist_manifest_name_mismatch')
+            if getattr(args, 'expect_genre', None) and man.get('genre') != args.expect_genre:
+                missing.append('playlist_genre_mismatch')
     ok = not missing
     manifest = write_manifest(args, playlist, text) if ok and args.manifest else None
-    print(json.dumps({"ok": ok, "playlist": playlist, "album": playlist, "missing": missing, "manifest": manifest, "audit": "playlist_album_routing_before_generation"}, ensure_ascii=False, indent=2))
+    print(json.dumps({"ok": ok, "playlist": playlist, "album": playlist, "missing": missing, "manifest": manifest, "manifest_info": manifest_info, "audit": "playlist_album_routing_before_generation"}, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
 def cmd_pre(args):
@@ -163,8 +209,14 @@ def cmd_post(args):
 
 def cmd_lyrics(args):
     text = args.text or Path(args.file).read_text(encoding='utf-8')
-    ok, missing = lyric_score(text, args.title)
-    print(json.dumps({"ok": ok, "length": len(text), "missing": missing, "audit": "lyrics_structure_hook_vietnamese_integrity"}, ensure_ascii=False, indent=2))
+    instrumental = bool(getattr(args, 'instrumental', False)) or is_instrumental_style(getattr(args, 'style', '') or '')
+    if instrumental:
+        ok, missing = lyric_score_instrumental(text)
+        audit = "lyrics_instrumental_section_map_no_filler"
+    else:
+        ok, missing = lyric_score(text, args.title)
+        audit = "lyrics_structure_hook_vietnamese_integrity"
+    print(json.dumps({"ok": ok, "instrumental": instrumental, "length": len(text), "missing": missing, "audit": audit}, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
 def tokens_for_novelty(s: str) -> set[str]:
@@ -224,7 +276,8 @@ def line_pattern_check(candidate: str, history_rows: list[dict], threshold_recen
     cand = [(l, line_pattern_signature(l)) for l in cand_lines]
     cand = [(l, s) for l, s in cand if s]
     hits = []
-    for row in history_rows[:threshold_recent]:
+    # F-03: history is append-only; the most recent rows live at the TAIL, not the head.
+    for row in reversed(history_rows[-threshold_recent:]):
         prev_text = '\n'.join(str(row.get(k,'')) for k in ['lyrics','prompt'])
         title = row.get('title') or row.get('id') or 'previous'
         for pl in lyric_lines(prev_text):
@@ -245,7 +298,8 @@ def motif_window_check(candidate: str, history_rows: list[dict], threshold_recen
         if sum(1 for k in kws if norm(k) in t) >= 2:
             cand_clusters.add(name)
     hits = []
-    for row in history_rows[:threshold_recent]:
+    # F-03: slice the most recent rows from the tail of the append-only history.
+    for row in reversed(history_rows[-threshold_recent:]):
         prev = norm('\n'.join(str(row.get(k,'')) for k in ['title','style','style_prompt','tags','lyrics','prompt']))
         for name in cand_clusters:
             kws = RECENT_MOTIF_KEYWORDS[name]
@@ -284,8 +338,8 @@ def main():
     a=sub.add_parser('build-compact'); a.add_argument('--max-chars', type=int, default=1000)
     a=sub.add_parser('precheck'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--max-chars', type=int, default=1000)
     a=sub.add_parser('postcheck'); a.add_argument('clip_ids', nargs='+'); a.add_argument('--suno', default='/root/.openclaw/workspace/bin/suno')
-    a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title')
-    a=sub.add_parser('playlist-route'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title', required=True); a.add_argument('--playlist'); a.add_argument('--manifest')
+    a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title'); a.add_argument('--instrumental', action='store_true', help='Instrumental mode: validate section map instead of vocal-song rules'); a.add_argument('--style', help='Style/tags text used to auto-detect instrumental mode')
+    a=sub.add_parser('playlist-route'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title', required=True); a.add_argument('--playlist'); a.add_argument('--manifest'); a.add_argument('--albums-root', help='Albums manifest root (suno-library/_albums); enables real manifest validation'); a.add_argument('--expect-genre', help='Require the resolved playlist manifest genre to equal this value')
     a=sub.add_parser('novelty-check'); a.add_argument('--title', required=True); a.add_argument('--style'); a.add_argument('--style-file'); a.add_argument('--lyrics'); a.add_argument('--lyrics-file'); a.add_argument('--history'); a.add_argument('--threshold', type=float, default=0.34); a.add_argument('--recent', type=int, default=10)
     args=p.parse_args()
     return {'build-compact':cmd_build,'precheck':cmd_pre,'postcheck':cmd_post,'lyrics-check':cmd_lyrics,'playlist-route':cmd_route,'novelty-check':cmd_novelty}[args.cmd](args)
