@@ -452,10 +452,18 @@ def cmd_novelty(args):
     lyrics = args.lyrics or (Path(args.lyrics_file).read_text(encoding='utf-8') if args.lyrics_file else '')
     candidate = '\n'.join([args.title or '', style, lyrics])
     history = load_history(args.history)
+    # v0.7.1: whole-song similarity compares TITLE+LYRICS only. Style prompts share a
+    # fixed genre/production scaffold (same 11-block skeleton per album), which inflated
+    # combined similarity above threshold and caused ~98% false-positive novelty blocks
+    # while actual lyric similarity was far below threshold. Style repetition is still
+    # covered by motif_window_check (style included there).
+    creative_candidate = '\n'.join([args.title or '', lyrics]) if lyrics else candidate
     hits=[]
     for r in history:
-        prev='\n'.join(str(r.get(k,'')) for k in ['title','style','style_prompt','tags','lyrics','prompt'])
-        sc=novelty_sim(candidate, prev)
+        prev_lyrics = '\n'.join(str(r.get(k,'')) for k in ['title','lyrics','prompt'])
+        prev_full = '\n'.join(str(r.get(k,'')) for k in ['title','style','style_prompt','tags','lyrics','prompt'])
+        prev = prev_lyrics if lyrics and (r.get('lyrics') or r.get('prompt')) else prev_full
+        sc=novelty_sim(creative_candidate, prev)
         if sc >= args.threshold:
             hits.append({'similarity': round(sc,3), 'title': r.get('title'), 'id': r.get('id'), 'created_at': r.get('created_at')})
     line_ok, line_hits = line_pattern_check(lyrics, history, args.recent)
