@@ -52,6 +52,99 @@ def build_compact() -> str:
 LYRIC_REQUIRED_SECTIONS = ["intro", "verse", "pre", "hook", "chorus", "bridge", "outro"]
 AI_FILLER = ["lalala", "placeholder", "insert lyrics", "tbd", "chatgpt"]
 
+# --- v0.7.0 Lyric Artistry Guard ---------------------------------------------
+# Viral/hook-oriented artistry rules for Vietnamese vocal songs:
+#  A-01 ai_cliche_phrases      : generic AI V-pop phrases kill authenticity
+#  A-02 english_leakage        : 0% English inside Vietnamese lyrics
+#  A-03 markdown_or_emdash     : prose formatting must never leak into lyrics
+#  A-04 hook_repetition        : hook line must recur (>=2 chorus blocks share it)
+#  A-05 hook_too_long          : hook line must stay punchy (<=9 words)
+#  A-06 unsingable_lines       : >12-word lines break phrasing; max 2 tolerated
+#  A-07 da_typo                : Vietnamese 'dạ' must never degrade to 'dą'
+#  A-08 stanza_monotony        : all stanzas same line-count = robotic structure
+AI_CLICHE_VI = [
+    "hành trình", "khát vọng", "vươn xa", "tỏa sáng", "cháy hết mình",
+    "chạm tới ước mơ", "vượt qua giông bão", "thắp sáng ước mơ",
+    "con tim rực cháy", "không gục ngã", "vươn tới trời cao",
+    "đam mê rực cháy", "hòa chung nhịp đập", "trái tim rực lửa",
+    "bạn và tôi cùng nhau", "nắm chặt tay nhau tiến bước", "mạnh mẽ vượt qua",
+]
+ENGLISH_COMMON = {
+    "the", "you", "love", "baby", "night", "light", "heart", "fire", "time",
+    "life", "dream", "forever", "tonight", "girl", "boy", "yeah", "oh", "my",
+    "me", "we", "and", "is", "are", "your", "shine", "sky", "fly", "high",
+    "world", "feel", "real", "soul", "stay", "way", "day", "know", "now",
+}
+MARKDOWN_MARKS = ["**", "##", "```", "---", "\u2014"]
+VI_DIACRITICS = "ăâêôơưđáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ"
+
+def _chorus_blocks(text: str) -> list[list[str]]:
+    blocks, cur, in_chorus = [], [], False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            if in_chorus and cur:
+                blocks.append(cur)
+            cur = []
+            ns = norm(s)
+            in_chorus = "chorus" in ns and "pre" not in ns
+            continue
+        if in_chorus and s:
+            cur.append(s)
+    if in_chorus and cur:
+        blocks.append(cur)
+    return blocks
+
+def lyric_artistry_score(text: str) -> tuple[bool, list[str]]:
+    t = norm(text)
+    missing: list[str] = []
+    cliche_hits = [c for c in AI_CLICHE_VI if norm(c) in t]
+    if cliche_hits:
+        missing.append("ai_cliche_phrases:" + "|".join(cliche_hits[:4]))
+    body_lines = lyric_lines(text)
+    eng_hits = []
+    for line in body_lines:
+        for w in re.findall(r"[A-Za-z]+", line):
+            lw = w.lower()
+            if lw in ENGLISH_COMMON and not any(ch in line for ch in VI_DIACRITICS):
+                eng_hits.append(lw)
+    if eng_hits:
+        missing.append("english_leakage:" + "|".join(sorted(set(eng_hits))[:5]))
+    md_hits = [m for m in MARKDOWN_MARKS if m in text]
+    if md_hits:
+        missing.append("markdown_or_emdash")
+    if "ą" in text or "Ą" in text:
+        missing.append("da_typo_a_ogonek")
+    blocks = _chorus_blocks(text)
+    if len(blocks) >= 2:
+        hook = norm(blocks[0][0]) if blocks[0] else ""
+        if hook:
+            recur = sum(1 for b in blocks if b and norm(b[0]) == hook)
+            if recur < 2:
+                missing.append("hook_not_repeated")
+        if blocks[0] and len(blocks[0][0].split()) > 9:
+            missing.append("hook_too_long")
+    elif blocks:
+        missing.append("single_chorus_block")
+    long_lines = [l for l in body_lines if len(l.split()) > 12]
+    if len(long_lines) > 2:
+        missing.append(f"unsingable_lines:{len(long_lines)}")
+    stanza_sizes = []
+    size = 0
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            if size:
+                stanza_sizes.append(size)
+            size = 0
+        elif s:
+            size += 1
+    if size:
+        stanza_sizes.append(size)
+    if len(stanza_sizes) >= 5 and len(set(stanza_sizes)) == 1:
+        missing.append("stanza_monotony")
+    return (not missing, missing)
+
 # F-01: instrumental-aware lyrics gate. Instrumental prompts carry section maps, not sung lyrics.
 INSTRUMENTAL_STYLE_HINTS = [
     "instrumental", "no vocals", "no vocal", "no singer", "no singing", "no lead vocal",
@@ -216,7 +309,54 @@ def cmd_lyrics(args):
     else:
         ok, missing = lyric_score(text, args.title)
         audit = "lyrics_structure_hook_vietnamese_integrity"
+        if not getattr(args, 'no_artistry', False):
+            art_ok, art_missing = lyric_artistry_score(text)
+            if not art_ok:
+                ok = False
+                missing = missing + [f"artistry:{m}" for m in art_missing]
+            audit += "+artistry_hook_viral_v070"
     print(json.dumps({"ok": ok, "instrumental": instrumental, "length": len(text), "missing": missing, "audit": audit}, ensure_ascii=False, indent=2))
+    return 0 if ok else 1
+
+def cmd_gate(args):
+    """One-shot pre-generation gate: style precheck + lyrics-check(+artistry)
+    [+ novelty when history given]. Single entry point so runners cannot skip
+    a layer. Exit 0 only when EVERY layer passes."""
+    style = Path(args.style_file).read_text(encoding='utf-8')
+    lyrics = Path(args.lyrics_file).read_text(encoding='utf-8')
+    report = {"title": args.title, "layers": {}, "audit": "gen_gate_all_layers_v070"}
+    s_ok, s_missing = score(style)
+    d_ok, d_missing = production_density(style)
+    style_missing = s_missing + [f"low_production_detail:{m}" for m in d_missing]
+    if len(style) > args.max_chars:
+        style_missing.append(f"too_long:{len(style)}>{args.max_chars}")
+    report["layers"]["style"] = {"ok": not style_missing, "missing": style_missing, "length": len(style)}
+    instrumental = bool(getattr(args, 'instrumental', False)) or is_instrumental_style(style)
+    if instrumental:
+        l_ok, l_missing = lyric_score_instrumental(lyrics)
+    else:
+        l_ok, l_missing = lyric_score(lyrics, args.title)
+        a_ok, a_missing = lyric_artistry_score(lyrics)
+        if not a_ok:
+            l_ok = False
+            l_missing = l_missing + [f"artistry:{m}" for m in a_missing]
+    report["layers"]["lyrics"] = {"ok": l_ok, "missing": l_missing, "instrumental": instrumental}
+    if args.history:
+        history = load_history(args.history)
+        candidate = '\n'.join([args.title or '', style, lyrics])
+        n_hits = []
+        for r in history:
+            prev = '\n'.join(str(r.get(k, '')) for k in ['title', 'style', 'style_prompt', 'tags', 'lyrics', 'prompt'])
+            sc = novelty_sim(candidate, prev)
+            if sc >= args.threshold:
+                n_hits.append({'similarity': round(sc, 3), 'title': r.get('title')})
+        line_ok, line_hits = line_pattern_check(lyrics, history, args.recent)
+        motif_ok, motif_hits = motif_window_check(candidate, history, args.recent)
+        n_ok = (not n_hits) and line_ok and motif_ok
+        report["layers"]["novelty"] = {"ok": n_ok, "whole_song_hits": n_hits[:3], "line_pattern_hits": line_hits[:3], "motif_window_hits": motif_hits[:3]}
+    ok = all(layer["ok"] for layer in report["layers"].values())
+    report["ok"] = ok
+    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
 def tokens_for_novelty(s: str) -> set[str]:
@@ -338,9 +478,10 @@ def main():
     a=sub.add_parser('build-compact'); a.add_argument('--max-chars', type=int, default=1000)
     a=sub.add_parser('precheck'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--max-chars', type=int, default=1000)
     a=sub.add_parser('postcheck'); a.add_argument('clip_ids', nargs='+'); a.add_argument('--suno', default='/root/.openclaw/workspace/bin/suno')
-    a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title'); a.add_argument('--instrumental', action='store_true', help='Instrumental mode: validate section map instead of vocal-song rules'); a.add_argument('--style', help='Style/tags text used to auto-detect instrumental mode')
+    a=sub.add_parser('lyrics-check'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title'); a.add_argument('--instrumental', action='store_true', help='Instrumental mode: validate section map instead of vocal-song rules'); a.add_argument('--style', help='Style/tags text used to auto-detect instrumental mode'); a.add_argument('--no-artistry', action='store_true', help='Skip v0.7.0 artistry layer (legacy behavior)')
+    a=sub.add_parser('gen-gate'); a.add_argument('--title', required=True); a.add_argument('--style-file', required=True); a.add_argument('--lyrics-file', required=True); a.add_argument('--max-chars', type=int, default=950); a.add_argument('--instrumental', action='store_true'); a.add_argument('--history'); a.add_argument('--threshold', type=float, default=0.34); a.add_argument('--recent', type=int, default=10)
     a=sub.add_parser('playlist-route'); a.add_argument('--text'); a.add_argument('--file'); a.add_argument('--title', required=True); a.add_argument('--playlist'); a.add_argument('--manifest'); a.add_argument('--albums-root', help='Albums manifest root (suno-library/_albums); enables real manifest validation'); a.add_argument('--expect-genre', help='Require the resolved playlist manifest genre to equal this value')
     a=sub.add_parser('novelty-check'); a.add_argument('--title', required=True); a.add_argument('--style'); a.add_argument('--style-file'); a.add_argument('--lyrics'); a.add_argument('--lyrics-file'); a.add_argument('--history'); a.add_argument('--threshold', type=float, default=0.34); a.add_argument('--recent', type=int, default=10)
     args=p.parse_args()
-    return {'build-compact':cmd_build,'precheck':cmd_pre,'postcheck':cmd_post,'lyrics-check':cmd_lyrics,'playlist-route':cmd_route,'novelty-check':cmd_novelty}[args.cmd](args)
+    return {'build-compact':cmd_build,'precheck':cmd_pre,'postcheck':cmd_post,'lyrics-check':cmd_lyrics,'playlist-route':cmd_route,'novelty-check':cmd_novelty,'gen-gate':cmd_gate}[args.cmd](args)
 if __name__ == '__main__': sys.exit(main())
